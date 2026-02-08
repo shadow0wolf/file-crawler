@@ -30,6 +30,115 @@ The codebase is intentionally small and centers around a few abstractions:
 5. **JsonBuffer** flushes metadata arrays into `metadata_*.json` files when the threshold is met.
 6. On completion, **CrawlerEngine** emits directory metadata, flushes, and writes a final checkpoint.
 
+## Architecture diagrams (ASCII)
+
+### High-level components
+
+```
+                           +-------------------+
+                           |   config.json     |
+                           +-------------------+
+                                     |
+                                     v
+                         +-----------------------+
+                         |      ConfigLoader     |
+                         +-----------------------+
+                                     |
+                                     v
+                         +-----------------------+
+                         |     CrawlerEngine     |
+                         +-----------------------+
+                          /          |          \
+                         /           |           \
+                        v            v            v
+         +-------------------+  +-------------------+  +----------------------+
+         | CheckpointManager |  |   Worker Pool     |  |   Consumer Thread    |
+         | + RunState        |  | FileMetadataExtr. |  |      JsonBuffer      |
+         +-------------------+  +-------------------+  +----------------------+
+                 |                         |                    |
+                 v                         v                    v
+        checkpoint.json             MetadataEnvelope     metadata_*.json
+```
+
+**What this means:** `CrawlerEngine` is the hub. It reads configuration, restores a prior run if needed, seeds traversal, and fans out work. The worker pool extracts metadata and produces `MetadataEnvelope` objects, while the consumer thread batches them into JSON files. `CheckpointManager` is consulted periodically to persist the current queue, counters, and directory stats so a crash or pause can be resumed deterministically.
+
+### Detailed runtime flow (queues, threads, and IO)
+
+```
+        Roots from config
+               |
+               v
+     +------------------+
+     | Directory Queue  |<-------------------------------+
+     +------------------+                                |
+               |                                           |
+               v                                           |
+     +------------------+     files + subdirs     +--------+-------+
+     | Traversal Loop   |------------------------>| IdRegistry     |
+     | (CrawlerEngine)  |                         +----------------+
+     +------------------+                                |
+               |                                         |
+       +-------+-------------------+                     |
+       |                           |                     |
+       v                           v                     |
++---------------+        +-------------------+           |
+| Worker Pool   |        | DirectoryStats    |           |
+| (Extractor)   |        | (per directory)   |           |
++---------------+        +-------------------+           |
+       |                           |                     |
+       v                           v                     |
+MetadataEnvelope            DirectoryStatsSnapshot       |
+       |                           |                     |
+       +------------+              |                     |
+                    v              v                     |
+               +-------------------------+               |
+               | Bounded Envelope Queue  |<--------------+
+               +-------------------------+
+                            |
+                            v
+                    +---------------+
+                    | JsonBuffer    |
+                    | (flush batch) |
+                    +---------------+
+                            |
+                            v
+                     metadata_*.json
+```
+
+**Step-by-step explanation:**
+
+1. **Seed traversal:** `CrawlerEngine` reads the configured roots and pushes the initial directories onto the in-memory queue.
+2. **Traverse and register IDs:** Each directory is popped, assigned a stable numeric ID via `IdRegistry`, and inspected for subdirectories and files.
+3. **Dispatch extraction:** File paths are submitted to the worker pool, where `FileMetadataExtractor` performs filesystem reads, MIME detection, hashing, and size/timestamp collection.
+4. **Aggregate directory stats:** As files are visited, `DirectoryStats` accumulates totals (counts, bytes, and hashes) and snapshots are created for checkpoint persistence.
+5. **Buffer envelopes:** Extracted file and directory records are wrapped in `MetadataEnvelope` objects and placed on the bounded queue for the consumer.
+6. **Flush output:** `JsonBuffer` consumes envelopes in batches and writes `metadata_000001.json`, `metadata_000002.json`, etc., ensuring deterministic ordering and segment sizes.
+
+### Checkpointing and recovery sequence
+
+```
+                +-------------------+
+Start --------->| Checkpoint exists?|--No--> Fresh run
+                +-------------------+
+                         |
+                        Yes
+                         v
+                +-------------------+
+                | Load RunState     |
+                | (queue, counters, |
+                |  stats snapshots) |
+                +-------------------+
+                         |
+                         v
+                +-------------------+
+                | Resume traversal  |
+                | + continue batch  |
+                | numbering         |
+                +-------------------+
+```
+
+**Why this is safe:** every N entries (configurable by `checkpointEntryInterval`), the crawler persists the directory queue, sequence numbers, and `DirectoryStatsSnapshot` so that a resumed run can continue from the same logical position without re-emitting already-flushed metadata batches.
+
 ## Build
 
 ```bash
