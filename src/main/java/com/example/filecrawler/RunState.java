@@ -11,6 +11,7 @@ public record RunState(
         int nextSequence,
         List<String> pendingDirectories,
         String inProgressDirectory,
-        Map<String, DirectoryStatsSnapshot> directoryStats
+        Map<String, DirectoryStatsSnapshot> directoryStats,
+        List<String> processedFiles
 ) {
 }

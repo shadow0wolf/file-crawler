@@ -47,109 +47,12 @@ public class CrawlerEngine {
     }
 
     public void run() throws IOException, InterruptedException {
-        Optional<RunState> existing = checkpointManager.load();
-        RunState runState = existing.orElse(null);
-
-        JsonFileSyncer syncer = JsonFileSyncer.noop();
-        if (config.s3SyncEnabled()) {
-            syncer = new S3SyncService(
-                    config.outputDirectory(),
-                    config.s3Bucket().orElseThrow(),
-                    config.s3Prefix().orElse(""),
-                    config.s3Region()
-            );
-        }
-
-        long startingId = runState == null ? 1L : runState.nextId();
-        int startingSequence = runState == null ? 1 : runState.nextSequence();
-
-        IdRegistry idRegistry = new IdRegistry(startingId);
-        Map<Path, DirectoryStats> directoryStats = new ConcurrentHashMap<>();
-        Set<Path> directories = ConcurrentHashMap.newKeySet();
-
-        if (runState != null) {
-            restoreDirectoryStats(directoryStats, runState.directoryStats());
-            directories.addAll(directoryStats.keySet());
-        }
-
-        // Buffer JSON payloads so we can write them in deterministic batches.
-        try {
-            JsonBuffer buffer = new JsonBuffer(
-                    mapper,
-                    config.outputDirectory(),
-                    config.bufferEntryThreshold(),
-                    startingSequence,
-                    syncer
-            );
-            BlockingQueue<MetadataEnvelope> resultQueue = new LinkedBlockingQueue<>();
-
-            // Dedicated consumer flushes metadata to disk while workers continue extracting.
-            Thread consumer = new Thread(() -> consumeResults(resultQueue, buffer));
-            consumer.start();
-
-            Deque<Path> pending = new ArrayDeque<>();
-            if (runState != null) {
-                runState.pendingDirectories().stream().map(Path::of).forEach(pending::addLast);
-                if (runState.inProgressDirectory() != null) {
-                    pending.addFirst(Path.of(runState.inProgressDirectory()));
-                }
-            } else {
-                config.roots().forEach(pending::addLast);
-            }
-
-            ExecutorService fileExecutor = Executors.newFixedThreadPool(config.threadCount());
-            FileMetadataExtractor extractor = new FileMetadataExtractor(new Tika());
-            AtomicLong processedEntries = new AtomicLong();
-            Set<Path> rootSet = config.roots().stream().map(this::normalize).collect(java.util.stream.Collectors.toSet());
-            boolean stopRequested = false;
-
-            while (!pending.isEmpty()) {
-                Path current = pending.removeFirst();
-                if (shouldSkipPath(current)) {
-                    continue;
-                }
-
-                // Persist progress before we begin scanning a directory so recovery can resume.
-                saveCheckpoint(idRegistry, buffer, pending, current, directoryStats);
-
-                BasicFileAttributes attrs;
-                try {
-                    attrs = Files.readAttributes(current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                } catch (IOException ex) {
-                    LOGGER.warn("Failed to read attributes for {}", current, ex);
-                    continue;
-                }
-
-                if (!attrs.isDirectory()) {
-                    continue;
-                }
-
-                directories.add(current);
-                directoryStats.computeIfAbsent(normalize(current), ignored -> new DirectoryStats());
-                idRegistry.idFor(current);
-
-                try (DirectoryStream<Path> stream = Files.newDirectoryStream(current)) {
-                    for (Path entry : stream) {
-                        if (shouldSkipPath(entry)) {
-                            continue;
-                        }
-                        if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
-                            pending.addLast(entry);
-                        } else if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
-                            long size = safeSize(entry);
-                            // Update stats for the directory ancestry chain while walking.
-                            updateAncestorStats(directoryStats, rootSet, entry, size);
-                            // File metadata extraction is parallelized across the executor.
-                            submitFileTask(fileExecutor, extractor, resultQueue, idRegistry, entry);
-                            long count = processedEntries.incrementAndGet();
-                            if (limiter.shouldStop(count)) {
-                                LOGGER.info("Stopping early after {} entries for checkpoint testing.", count);
-                                stopRequested = true;
         Path outputDirectory = config.outputDirectory();
         ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
         Optional<RunState> loadedState = checkpointManager == null ? Optional.empty() : checkpointManager.load();
         Deque<Path> directoryQueue = new ArrayDeque<>();
+        Set<Path> queuedDirectories = new HashSet<>();
         Map<Path, DirectoryStats> directoryStats = new HashMap<>();
         List<Path> visitedDirectories = new ArrayList<>();
         Set<Path> processedFiles = new HashSet<>();
@@ -164,13 +67,26 @@ public class CrawlerEngine {
             idRegistry = new IdRegistry(state.nextId());
             nextMetadataSequence = state.nextSequence();
             processedFiles.addAll(loadProcessedFiles(outputDirectory, mapper));
+            if (state.processedFiles() != null) {
+                state.processedFiles().stream()
+                        .filter(path -> path != null && !path.isBlank())
+                        .map(Path::of)
+                        .map(path -> path.toAbsolutePath().normalize())
+                        .forEach(processedFiles::add);
+            }
             if (state.inProgressDirectory() != null) {
-                directoryQueue.add(Path.of(state.inProgressDirectory()).toAbsolutePath().normalize());
+                Path normalized = Path.of(state.inProgressDirectory()).toAbsolutePath().normalize();
+                directoryQueue.add(normalized);
+                queuedDirectories.add(normalized);
             }
             state.pendingDirectories().stream()
                     .map(Path::of)
                     .map(path -> path.toAbsolutePath().normalize())
-                    .forEach(directoryQueue::add);
+                    .forEach(path -> {
+                        if (queuedDirectories.add(path)) {
+                            directoryQueue.add(path);
+                        }
+                    });
             state.directoryStats().forEach((path, snapshot) -> {
                 Path dirPath = Path.of(path).toAbsolutePath().normalize();
                 directoryStats.put(dirPath, new DirectoryStats(snapshot.totalFiles(), snapshot.totalBytes()));
@@ -179,150 +95,138 @@ public class CrawlerEngine {
         } else {
             idRegistry = new IdRegistry(1L);
             for (Path root : rootPaths) {
-                directoryQueue.add(root);
+                Path normalized = root.toAbsolutePath().normalize();
+                if (queuedDirectories.add(normalized)) {
+                    directoryQueue.add(normalized);
+                }
             }
         }
 
         int nextFailureSequence = determineNextSequence(outputDirectory, "failed_");
-        JsonBuffer<MetadataEnvelope> metadataBuffer = new JsonBuffer<>(mapper, outputDirectory,
-                config.bufferEntryThreshold(), nextMetadataSequence);
-        JsonBuffer<FailedFileRecord> failureBuffer = new JsonBuffer<>(mapper, outputDirectory,
-                config.bufferEntryThreshold(), nextFailureSequence, "failed_");
+        JsonFileSyncer syncer = JsonFileSyncer.noop();
+        if (config.s3SyncEnabled()) {
+            syncer = new S3SyncService(
+                    outputDirectory,
+                    config.s3Bucket().orElseThrow(),
+                    config.s3Prefix().orElse(""),
+                    config.s3Region()
+            );
+        }
 
-        ExecutorService executor = Executors.newFixedThreadPool(config.threadCount());
-        CompletionService<FileProcessingResult> completionService = new ExecutorCompletionService<>(executor);
+        try {
+            JsonBuffer<MetadataEnvelope> metadataBuffer = new JsonBuffer<>(mapper, outputDirectory,
+                    config.bufferEntryThreshold(), nextMetadataSequence, syncer);
+            JsonBuffer<FailedFileRecord> failureBuffer = new JsonBuffer<>(mapper, outputDirectory,
+                    config.bufferEntryThreshold(), nextFailureSequence, "failed_", syncer);
 
-        List<PathMatcher> fileMatchers = buildMatchers(config.excludeFilePatterns());
-        List<PathMatcher> directoryMatchers = buildMatchers(config.excludeDirectoryPatterns());
+            ExecutorService executor = Executors.newFixedThreadPool(config.threadCount());
+            CompletionService<FileProcessingResult> completionService = new ExecutorCompletionService<>(executor);
 
-        long processedCount = 0L;
-        int inFlight = 0;
-        boolean stopRequested = false;
-        int maxInFlight = limiter == ProcessingLimiter.NO_LIMIT && config.maxEntries().isEmpty()
-                ? config.threadCount()
-                : 1;
+            List<PathMatcher> fileMatchers = buildMatchers(config.excludeFilePatterns());
+            List<PathMatcher> directoryMatchers = buildMatchers(config.excludeDirectoryPatterns());
 
-        Path currentDirectory = null;
-        while ((!directoryQueue.isEmpty() || inFlight > 0) && !stopRequested) {
-            while (!directoryQueue.isEmpty() && !stopRequested) {
-                Path directory = directoryQueue.poll();
-                if (directory == null) {
-                    break;
-                }
-                currentDirectory = directory;
-                if (matchesAny(directory, directoryMatchers)) {
-                    logger.debug("Skipping excluded directory: {}", directory);
-                    continue;
-                }
-                if (!config.followLinks() && Files.isSymbolicLink(directory)) {
-                    logger.debug("Skipping symlinked directory: {}", directory);
-                    continue;
-                }
-                Path normalizedDirectory = directory.toAbsolutePath().normalize();
-                if (!visitedDirectories.contains(normalizedDirectory)) {
-                    visitedDirectories.add(normalizedDirectory);
-                }
-                if (checkpointManager != null) {
-                    saveCheckpoint(directoryQueue, directory, idRegistry, metadataBuffer, directoryStats);
-                }
+            long processedCount = 0L;
+            int inFlight = 0;
+            boolean stopRequested = false;
+            int maxInFlight = limiter == ProcessingLimiter.NO_LIMIT && config.maxEntries().isEmpty()
+                    ? config.threadCount()
+                    : 1;
 
-                try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
-                    for (Path entry : stream) {
-                        if (stopRequested) {
-                            break;
-                        }
-                        Path normalizedEntry = entry.toAbsolutePath().normalize();
-                        if (Files.isDirectory(entry)) {
-                            if (matchesAny(normalizedEntry, directoryMatchers)) {
-                                continue;
-                            }
-                            if (!config.followLinks() && Files.isSymbolicLink(entry)) {
-                                continue;
-                            }
-                            directoryQueue.add(normalizedEntry);
-                        } else if (Files.isRegularFile(entry)) {
-                            if (matchesAny(normalizedEntry, fileMatchers)) {
-                                continue;
-                            }
-                            if (processedFiles.contains(normalizedEntry)) {
-                                continue;
-                            }
-                            if (config.maxEntries().isPresent()
-                                    && processedCount + inFlight >= config.maxEntries().get()) {
-                                stopRequested = true;
+            Path currentDirectory = null;
+            while ((!directoryQueue.isEmpty() || inFlight > 0) && !stopRequested) {
+                while (!directoryQueue.isEmpty() && !stopRequested) {
+                    Path directory = directoryQueue.poll();
+                    if (directory == null) {
+                        break;
+                    }
+                    queuedDirectories.remove(directory);
+                    currentDirectory = directory;
+                    if (matchesAny(directory, directoryMatchers)) {
+                        logger.debug("Skipping excluded directory: {}", directory);
+                        continue;
+                    }
+                    if (!config.followLinks() && Files.isSymbolicLink(directory)) {
+                        logger.debug("Skipping symlinked directory: {}", directory);
+                        continue;
+                    }
+                    Path normalizedDirectory = directory.toAbsolutePath().normalize();
+                    if (!visitedDirectories.contains(normalizedDirectory)) {
+                        visitedDirectories.add(normalizedDirectory);
+                    }
+                    if (checkpointManager != null) {
+                        saveCheckpoint(directoryQueue, directory, idRegistry, metadataBuffer, directoryStats, processedFiles);
+                    }
+
+                    try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+                        for (Path entry : stream) {
+                            if (stopRequested) {
                                 break;
                             }
-                            completionService.submit(() -> processFile(normalizedEntry, idRegistry));
-                            inFlight++;
+                            Path normalizedEntry = entry.toAbsolutePath().normalize();
+                            if (Files.isDirectory(entry)) {
+                                if (matchesAny(normalizedEntry, directoryMatchers)) {
+                                    continue;
+                                }
+                                if (!config.followLinks() && Files.isSymbolicLink(entry)) {
+                                    continue;
+                                }
+                                if (queuedDirectories.add(normalizedEntry)) {
+                                    directoryQueue.add(normalizedEntry);
+                                }
+                            } else if (Files.isRegularFile(entry)) {
+                                if (matchesAny(normalizedEntry, fileMatchers)) {
+                                    continue;
+                                }
+                                if (processedFiles.contains(normalizedEntry)) {
+                                    continue;
+                                }
+                                if (config.maxEntries().isPresent()
+                                        && processedCount + inFlight >= config.maxEntries().get()) {
+                                    stopRequested = true;
+                                    break;
+                                }
+                                completionService.submit(() -> processFile(normalizedEntry, idRegistry));
+                                inFlight++;
 
-                            if (inFlight >= maxInFlight) {
-                                Future<FileProcessingResult> future = completionService.take();
-                                processedCount += handleResult(future, metadataBuffer, failureBuffer, directoryStats, rootPaths, processedFiles);
-                                inFlight--;
-                                stopRequested = shouldStop(processedCount);
-                                maybeCheckpoint(processedCount, directoryQueue, directory, idRegistry, metadataBuffer, directoryStats);
+                                if (inFlight >= maxInFlight) {
+                                    Future<FileProcessingResult> future = completionService.take();
+                                    processedCount += handleResult(future, metadataBuffer, failureBuffer, directoryStats, rootPaths, processedFiles);
+                                    inFlight--;
+                                    stopRequested = shouldStop(processedCount);
+                                    maybeCheckpoint(processedCount, directoryQueue, directory, idRegistry, metadataBuffer, directoryStats, processedFiles);
+                                }
                             }
                         }
+                    } catch (IOException ex) {
+                        logger.warn("Failed to scan directory {}", directory, ex);
                     }
-                } catch (IOException ex) {
-                    LOGGER.warn("Failed to list directory {}", current, ex);
                 }
 
-                // Periodically checkpoint based on processed file counts.
-                if (processedEntries.get() % config.checkpointEntryInterval() == 0) {
-                    saveCheckpoint(idRegistry, buffer, pending, null, directoryStats);
-                }
-                if (stopRequested || limiter.shouldStop(processedEntries.get())) {
-                    break;
+                while (inFlight > 0 && !stopRequested) {
+                    Future<FileProcessingResult> future = completionService.take();
+                    processedCount += handleResult(future, metadataBuffer, failureBuffer, directoryStats, rootPaths, processedFiles);
+                    inFlight--;
+                    stopRequested = shouldStop(processedCount);
+                    maybeCheckpoint(processedCount, directoryQueue, null, idRegistry, metadataBuffer, directoryStats, processedFiles);
                 }
             }
 
-            // Drain worker pool and flush the remaining buffered metadata.
-            fileExecutor.shutdown();
-            fileExecutor.awaitTermination(1, TimeUnit.HOURS);
-            resultQueue.add(POISON);
-            consumer.join();
-            buffer.flush();
+            executor.shutdown();
+            executor.awaitTermination(1, TimeUnit.HOURS);
 
-            if (stopRequested) {
-                saveCheckpoint(idRegistry, buffer, pending, null, directoryStats);
-                LOGGER.info("Crawl paused with checkpoint.");
-                return;
+            if (!stopRequested) {
+                emitDirectoryMetadata(metadataBuffer, visitedDirectories, directoryStats, idRegistry);
             }
 
-            // Directory metadata is derived after file processing so totals are complete.
-            emitDirectoryMetadata(idRegistry, directories, directoryStats, buffer);
-            buffer.flush();
-            saveCheckpoint(idRegistry, buffer, new ArrayDeque<>(), null, directoryStats);
-            LOGGER.info("Crawl completed.");
+            metadataBuffer.close();
+            failureBuffer.close();
+
+            if (checkpointManager != null) {
+                Path inProgress = stopRequested ? currentDirectory : null;
+                saveCheckpoint(directoryQueue, inProgress, idRegistry, metadataBuffer, directoryStats, processedFiles);
+            }
         } finally {
             syncer.close();
-        }
-                    logger.warn("Failed to scan directory {}", directory, ex);
-                }
-            }
-
-            while (inFlight > 0 && !stopRequested) {
-                Future<FileProcessingResult> future = completionService.take();
-                processedCount += handleResult(future, metadataBuffer, failureBuffer, directoryStats, rootPaths, processedFiles);
-                inFlight--;
-                stopRequested = shouldStop(processedCount);
-                maybeCheckpoint(processedCount, directoryQueue, null, idRegistry, metadataBuffer, directoryStats);
-            }
-        }
-
-        executor.shutdown();
-
-        if (!stopRequested) {
-            emitDirectoryMetadata(metadataBuffer, visitedDirectories, directoryStats, idRegistry);
-        }
-
-        metadataBuffer.close();
-        failureBuffer.close();
-
-        if (checkpointManager != null) {
-            Path inProgress = stopRequested ? currentDirectory : null;
-            saveCheckpoint(directoryQueue, inProgress, idRegistry, metadataBuffer, directoryStats);
         }
     }
 
@@ -457,12 +361,13 @@ public class CrawlerEngine {
                                  Path inProgressDirectory,
                                  IdRegistry idRegistry,
                                  JsonBuffer<MetadataEnvelope> metadataBuffer,
-                                 Map<Path, DirectoryStats> directoryStats) throws IOException {
+                                 Map<Path, DirectoryStats> directoryStats,
+                                 Set<Path> processedFiles) throws IOException {
         if (checkpointManager == null) {
             return;
         }
         if (processedCount % config.checkpointEntryInterval() == 0) {
-            saveCheckpoint(directoryQueue, inProgressDirectory, idRegistry, metadataBuffer, directoryStats);
+            saveCheckpoint(directoryQueue, inProgressDirectory, idRegistry, metadataBuffer, directoryStats, processedFiles);
         }
     }
 
@@ -470,11 +375,15 @@ public class CrawlerEngine {
                                 Path inProgressDirectory,
                                 IdRegistry idRegistry,
                                 JsonBuffer<MetadataEnvelope> metadataBuffer,
-                                Map<Path, DirectoryStats> directoryStats) throws IOException {
+                                Map<Path, DirectoryStats> directoryStats,
+                                Set<Path> processedFiles) throws IOException {
         if (checkpointManager == null) {
             return;
         }
         List<String> pendingDirectories = directoryQueue.stream().map(Path::toString).toList();
+        List<String> processed = processedFiles.stream()
+                .map(Path::toString)
+                .toList();
         Map<String, DirectoryStatsSnapshot> statsSnapshot = new HashMap<>();
         directoryStats.forEach((path, stats) -> statsSnapshot.put(path.toString(), DirectoryStatsSnapshot.from(stats)));
 
@@ -483,7 +392,8 @@ public class CrawlerEngine {
                 metadataBuffer.nextSequence(),
                 pendingDirectories,
                 inProgressDirectory == null ? null : inProgressDirectory.toString(),
-                statsSnapshot
+                statsSnapshot,
+                processed
         );
         checkpointManager.save(state);
     }

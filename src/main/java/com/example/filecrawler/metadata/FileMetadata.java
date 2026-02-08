@@ -11,7 +11,7 @@ public record FileMetadata(
         long id,
         long parentId,
         @JsonProperty(access = JsonProperty.Access.WRITE_ONLY) String parentPath,
-        @JsonProperty(access = JsonProperty.Access.WRITE_ONLY) String path,
+        String path,
         String name,
         long size,
         String mimeType,
