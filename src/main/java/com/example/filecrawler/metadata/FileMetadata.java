@@ -2,6 +2,9 @@ package com.example.filecrawler.metadata;
 
 import java.time.Instant;
 
+/**
+ * Serialized metadata describing a single file and its derived attributes.
+ */
 public record FileMetadata(
         long id,
         long parentId,

@@ -4,6 +4,9 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 
+/**
+ * Immutable runtime settings for the crawler.
+ */
 public record CrawlerConfig(
         List<Path> roots,
         Path outputDirectory,

@@ -17,10 +17,16 @@ import java.time.Instant;
 public final class FileMetadataExtractor {
     private final Tika tika;
 
+    /**
+     * Extracts metadata for files using Apache Tika for MIME detection.
+     */
     public FileMetadataExtractor(Tika tika) {
         this.tika = tika;
     }
 
+    /**
+     * Reads filesystem metadata and derived fields (MIME type + SHA-256 hash).
+     */
     public FileMetadata extract(Path path, long id, long parentId) throws IOException {
         String parentPath = path.getParent() == null ? null : path.getParent().toAbsolutePath().toString();
         BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
@@ -59,6 +65,7 @@ public final class FileMetadataExtractor {
         } catch (NoSuchAlgorithmException ex) {
             throw new IllegalStateException("SHA-256 not available", ex);
         }
+        // Stream file data to avoid loading large files into memory.
         try (InputStream stream = Files.newInputStream(path)) {
             byte[] buffer = new byte[8192];
             int read;

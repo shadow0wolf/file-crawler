@@ -17,6 +17,9 @@ public final class JsonBuffer {
     private final List<MetadataEnvelope> buffer = new ArrayList<>();
     private final AtomicInteger sequence;
 
+    /**
+     * Buffers metadata envelopes and writes them to sequential JSON files.
+     */
     public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence) {
         this.mapper = mapper;
         this.outputDirectory = outputDirectory;
@@ -24,10 +27,16 @@ public final class JsonBuffer {
         this.sequence = new AtomicInteger(startingSequence);
     }
 
+    /**
+     * Returns the next sequence number to be used when flushing output.
+     */
     public synchronized int currentSequence() {
         return sequence.get();
     }
 
+    /**
+     * Adds a metadata envelope to the buffer, flushing when the threshold is met.
+     */
     public synchronized void add(MetadataEnvelope envelope) throws IOException {
         buffer.add(envelope);
         if (buffer.size() >= threshold) {
@@ -35,6 +44,9 @@ public final class JsonBuffer {
         }
     }
 
+    /**
+     * Flushes the current buffer to a JSON file and clears the in-memory list.
+     */
     public synchronized void flush() throws IOException {
         if (buffer.isEmpty()) {
             return;
