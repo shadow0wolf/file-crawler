@@ -23,6 +23,30 @@ public class ConfigLoader {
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     }
 
+    /**
+     * Loads the crawler configuration from a JSON file and applies defaults for
+     * optional fields (buffer thresholds, thread count, checkpoint file).
+     */
+    public static CrawlerConfig load(Path configPath) throws IOException {
+        ConfigPayload payload = MAPPER.readValue(Files.newBufferedReader(configPath), ConfigPayload.class);
+        List<Path> roots = payload.roots.stream().map(Path::of).collect(Collectors.toList());
+        Path outputDirectory = Path.of(payload.outputDirectory);
+        int bufferThreshold = payload.bufferEntryThreshold == null ? 1000 : payload.bufferEntryThreshold;
+        int checkpointInterval = payload.checkpointEntryInterval == null ? 2000 : payload.checkpointEntryInterval;
+        int threadCount = payload.threadCount == null ? Runtime.getRuntime().availableProcessors() : payload.threadCount;
+        boolean followLinks = payload.followLinks != null && payload.followLinks;
+        // If omitted, checkpoint defaults to the output directory.
+        Optional<Path> checkpointFile = Optional.ofNullable(payload.checkpointFile)
+                .map(Path::of)
+                .or(() -> Optional.of(outputDirectory.resolve("checkpoint.json")));
+        Optional<Integer> maxEntries = Optional.ofNullable(payload.maxEntries);
+        boolean s3SyncEnabled = payload.s3SyncEnabled != null && payload.s3SyncEnabled;
+        Optional<String> s3Bucket = Optional.ofNullable(payload.s3Bucket).filter(value -> !value.isBlank());
+        Optional<String> s3Prefix = Optional.ofNullable(payload.s3Prefix).filter(value -> !value.isBlank());
+        Optional<String> s3Region = Optional.ofNullable(payload.s3Region).filter(value -> !value.isBlank());
+        if (s3SyncEnabled && s3Bucket.isEmpty()) {
+            throw new IllegalArgumentException("s3Bucket is required when s3SyncEnabled is true.");
+        }
     public CrawlerConfig load(Path path) throws IOException {
         RawConfig raw = mapper.readValue(path.toFile(), RawConfig.class);
 
@@ -60,6 +84,10 @@ public class ConfigLoader {
                 followLinks,
                 checkpointFile,
                 maxEntries,
+                s3SyncEnabled,
+                s3Bucket,
+                s3Prefix,
+                s3Region
                 fileRetryAttempts,
                 excludeFilePatterns,
                 excludeDirectoryPatterns
@@ -82,6 +110,10 @@ public class ConfigLoader {
         public Boolean followLinks;
         public String checkpointFile;
         public Integer maxEntries;
+        public Boolean s3SyncEnabled;
+        public String s3Bucket;
+        public String s3Prefix;
+        public String s3Region;
         public Integer fileRetryAttempts;
         public List<String> excludeFilePatterns;
         public List<String> excludeDirectoryPatterns;

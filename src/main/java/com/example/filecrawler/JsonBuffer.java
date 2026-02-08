@@ -14,6 +14,19 @@ public class JsonBuffer<T> {
     private final Path outputDirectory;
     private final String prefix;
     private final int threshold;
+    private final JsonFileSyncer syncer;
+    private final List<MetadataEnvelope> buffer = new ArrayList<>();
+    private final AtomicInteger sequence;
+
+    /**
+     * Buffers metadata envelopes and writes them to sequential JSON files.
+     */
+    public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence, JsonFileSyncer syncer) {
+        this.mapper = mapper;
+        this.outputDirectory = outputDirectory;
+        this.threshold = threshold;
+        this.syncer = syncer;
+        this.sequence = new AtomicInteger(startingSequence);
     private final List<T> buffer;
     private int sequence;
 
@@ -49,6 +62,7 @@ public class JsonBuffer<T> {
         Path file = outputDirectory.resolve(String.format("%s%06d.json", prefix, sequence++));
         mapper.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), buffer);
         buffer.clear();
+        syncer.enqueue(target);
     }
 
     public synchronized void close() throws IOException {

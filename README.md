@@ -166,6 +166,10 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
   "threadCount": 8,
   "followLinks": false,
   "checkpointFile": "C:/crawler-output/checkpoint.json",
+  "s3SyncEnabled": false,
+  "s3Bucket": "example-bucket",
+  "s3Prefix": "crawler-output",
+  "s3Region": "us-east-1"
   "fileRetryAttempts": 3,
   "excludeFilePatterns": [
     "*.tmp",
@@ -181,6 +185,10 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
 ### Optional testing field
 
 `maxEntries` can be set to limit the number of files processed before a checkpoint is written (useful for testing recovery).
+
+### Optional S3 sync
+
+When `s3SyncEnabled` is true, each generated `metadata_*.json` file is uploaded to the configured bucket using a dedicated single-threaded sync worker. Supply `s3Bucket` to enable uploads and optionally set `s3Prefix` and `s3Region` to control the destination key and AWS region.
 
 ## Output
 
