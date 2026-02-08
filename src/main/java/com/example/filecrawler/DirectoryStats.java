@@ -14,6 +14,9 @@ public final class DirectoryStats {
         this.totalBytes.set(totalBytes);
     }
 
+    /**
+     * Adds a file and its size to the directory totals.
+     */
     public void addFile(long size) {
         totalFiles.incrementAndGet();
         totalBytes.addAndGet(size);

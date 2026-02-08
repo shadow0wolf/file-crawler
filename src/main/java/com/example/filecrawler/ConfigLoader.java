@@ -16,6 +16,10 @@ public final class ConfigLoader {
     private ConfigLoader() {
     }
 
+    /**
+     * Loads the crawler configuration from a JSON file and applies defaults for
+     * optional fields (buffer thresholds, thread count, checkpoint file).
+     */
     public static CrawlerConfig load(Path configPath) throws IOException {
         ConfigPayload payload = MAPPER.readValue(Files.newBufferedReader(configPath), ConfigPayload.class);
         List<Path> roots = payload.roots.stream().map(Path::of).collect(Collectors.toList());
@@ -24,6 +28,7 @@ public final class ConfigLoader {
         int checkpointInterval = payload.checkpointEntryInterval == null ? 2000 : payload.checkpointEntryInterval;
         int threadCount = payload.threadCount == null ? Runtime.getRuntime().availableProcessors() : payload.threadCount;
         boolean followLinks = payload.followLinks != null && payload.followLinks;
+        // If omitted, checkpoint defaults to the output directory.
         Optional<Path> checkpointFile = Optional.ofNullable(payload.checkpointFile)
                 .map(Path::of)
                 .or(() -> Optional.of(outputDirectory.resolve("checkpoint.json")));

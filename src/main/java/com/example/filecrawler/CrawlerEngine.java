@@ -32,6 +32,10 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Orchestrates the crawl lifecycle: directory traversal, file metadata extraction,
+ * buffering output to JSON, and checkpoint persistence for recovery.
+ */
 public final class CrawlerEngine {
     private static final Logger LOGGER = LoggerFactory.getLogger(CrawlerEngine.class);
     private static final MetadataEnvelope POISON = new MetadataEnvelope("poison", "poison");
@@ -51,6 +55,11 @@ public final class CrawlerEngine {
         this.limiter = limiter;
     }
 
+    /**
+     * Executes a crawl run. The method restores prior checkpoint state (if present),
+     * streams file metadata to a background consumer, and emits directory summaries
+     * at the end of a successful run.
+     */
     public void run() throws IOException, InterruptedException {
         Optional<RunState> existing = checkpointManager.load();
         RunState runState = existing.orElse(null);
@@ -67,9 +76,11 @@ public final class CrawlerEngine {
             directories.addAll(directoryStats.keySet());
         }
 
+        // Buffer JSON payloads so we can write them in deterministic batches.
         JsonBuffer buffer = new JsonBuffer(mapper, config.outputDirectory(), config.bufferEntryThreshold(), startingSequence);
         BlockingQueue<MetadataEnvelope> resultQueue = new LinkedBlockingQueue<>();
 
+        // Dedicated consumer flushes metadata to disk while workers continue extracting.
         Thread consumer = new Thread(() -> consumeResults(resultQueue, buffer));
         consumer.start();
 
@@ -95,6 +106,7 @@ public final class CrawlerEngine {
                 continue;
             }
 
+            // Persist progress before we begin scanning a directory so recovery can resume.
             saveCheckpoint(idRegistry, buffer, pending, current, directoryStats);
 
             BasicFileAttributes attrs;
@@ -122,7 +134,9 @@ public final class CrawlerEngine {
                         pending.addLast(entry);
                     } else if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
                         long size = safeSize(entry);
+                        // Update stats for the directory ancestry chain while walking.
                         updateAncestorStats(directoryStats, rootSet, entry, size);
+                        // File metadata extraction is parallelized across the executor.
                         submitFileTask(fileExecutor, extractor, resultQueue, idRegistry, entry);
                         long count = processedEntries.incrementAndGet();
                         if (limiter.shouldStop(count)) {
@@ -135,6 +149,7 @@ public final class CrawlerEngine {
                 LOGGER.warn("Failed to list directory {}", current, ex);
             }
 
+            // Periodically checkpoint based on processed file counts.
             if (processedEntries.get() % config.checkpointEntryInterval() == 0) {
                 saveCheckpoint(idRegistry, buffer, pending, null, directoryStats);
             }
@@ -143,6 +158,7 @@ public final class CrawlerEngine {
             }
         }
 
+        // Drain worker pool and flush the remaining buffered metadata.
         fileExecutor.shutdown();
         fileExecutor.awaitTermination(1, TimeUnit.HOURS);
         resultQueue.add(POISON);
@@ -155,6 +171,7 @@ public final class CrawlerEngine {
             return;
         }
 
+        // Directory metadata is derived after file processing so totals are complete.
         emitDirectoryMetadata(idRegistry, directories, directoryStats, buffer);
         buffer.flush();
         saveCheckpoint(idRegistry, buffer, new ArrayDeque<>(), null, directoryStats);
