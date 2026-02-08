@@ -1,8 +1,8 @@
 package com.example.filecrawler;
 
 import com.example.filecrawler.metadata.FileMetadata;
-import org.apache.commons.codec.binary.Hex;
 import org.apache.tika.Tika;
+import org.apache.tika.mime.MediaType;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -14,65 +14,72 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 
-public final class FileMetadataExtractor {
+public class FileMetadataExtractor {
     private final Tika tika;
 
-    /**
-     * Extracts metadata for files using Apache Tika for MIME detection.
-     */
     public FileMetadataExtractor(Tika tika) {
         this.tika = tika;
     }
 
-    /**
-     * Reads filesystem metadata and derived fields (MIME type + SHA-256 hash).
-     */
     public FileMetadata extract(Path path, long id, long parentId) throws IOException {
-        String parentPath = path.getParent() == null ? null : path.getParent().toAbsolutePath().toString();
-        BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-        long size = attrs.size();
+        return extract(path, id, parentId, true);
+    }
+
+    public FileMetadata extract(Path path, long id, long parentId, boolean followLinks) throws IOException {
+        LinkOption[] linkOptions = followLinks ? new LinkOption[0] : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
+        BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class, linkOptions);
+        long size = attributes.size();
+        Instant createdTime = attributes.creationTime().toInstant();
+        Instant modifiedTime = attributes.lastModifiedTime().toInstant();
+        Instant accessTime = attributes.lastAccessTime().toInstant();
         String mimeType = detectMimeType(path);
-        String hash = hashSha256(path);
-        Instant created = attrs.creationTime().toInstant();
-        Instant modified = attrs.lastModifiedTime().toInstant();
-        Instant accessed = attrs.lastAccessTime().toInstant();
+        String sha256 = computeSha256(path);
+        String parentPath = path.getParent() == null ? null : path.getParent().toString();
+        String fileKey = attributes.fileKey() == null ? null : attributes.fileKey().toString();
         return new FileMetadata(
                 id,
                 parentId,
                 parentPath,
-                path.toAbsolutePath().toString(),
-                path.getFileName() == null ? path.toString() : path.getFileName().toString(),
+                path.toString(),
+                path.getFileName().toString(),
                 size,
                 mimeType,
-                hash,
-                created,
-                modified,
-                accessed,
-                attrs.fileKey() == null ? null : attrs.fileKey().toString()
+                sha256,
+                createdTime,
+                modifiedTime,
+                accessTime,
+                fileKey
         );
     }
 
-    private String detectMimeType(Path path) throws IOException {
-        try (InputStream stream = Files.newInputStream(path)) {
-            return tika.detect(stream, path.getFileName() == null ? path.toString() : path.getFileName().toString());
+    private String detectMimeType(Path path) {
+        try {
+            MediaType mediaType = MediaType.parse(tika.detect(path));
+            return mediaType == null ? "application/octet-stream" : mediaType.toString();
+        } catch (IOException ex) {
+            return "application/octet-stream";
         }
     }
 
-    private String hashSha256(Path path) throws IOException {
+    private String computeSha256(Path path) throws IOException {
         MessageDigest digest;
         try {
             digest = MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException ex) {
-            throw new IllegalStateException("SHA-256 not available", ex);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
         }
-        // Stream file data to avoid loading large files into memory.
-        try (InputStream stream = Files.newInputStream(path)) {
+        try (InputStream inputStream = Files.newInputStream(path)) {
             byte[] buffer = new byte[8192];
             int read;
-            while ((read = stream.read(buffer)) != -1) {
+            while ((read = inputStream.read(buffer)) != -1) {
                 digest.update(buffer, 0, read);
             }
         }
-        return Hex.encodeHexString(digest.digest());
+        byte[] hash = digest.digest();
+        StringBuilder builder = new StringBuilder(hash.length * 2);
+        for (byte b : hash) {
+            builder.append(String.format("%02x", b));
+        }
+        return builder.toString();
     }
 }

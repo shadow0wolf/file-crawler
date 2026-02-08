@@ -165,7 +165,16 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
   "checkpointEntryInterval": 2000,
   "threadCount": 8,
   "followLinks": false,
-  "checkpointFile": "C:/crawler-output/checkpoint.json"
+  "checkpointFile": "C:/crawler-output/checkpoint.json",
+  "fileRetryAttempts": 3,
+  "excludeFilePatterns": [
+    "*.tmp",
+    "*.bak"
+  ],
+  "excludeDirectoryPatterns": [
+    "**/node_modules",
+    "**/.git"
+  ]
 }
 ```
 
@@ -176,6 +185,8 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
 ## Output
 
 Each flush writes a JSON array of `MetadataEnvelope` objects to `metadata_000001.json`, `metadata_000002.json`, etc. Each envelope contains a `type` (`file` or `directory`) and the related metadata payload.
+
+Failed file extractions are written to `failed_000001.json`, `failed_000002.json`, etc. Each record includes the file path, the total attempts, and a list of retry attempts (timestamps and error messages).
 
 ## Recovery
 

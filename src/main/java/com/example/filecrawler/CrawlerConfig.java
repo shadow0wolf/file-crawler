@@ -15,6 +15,9 @@ public record CrawlerConfig(
         int threadCount,
         boolean followLinks,
         Optional<Path> checkpointFile,
-        Optional<Integer> maxEntries
+        Optional<Integer> maxEntries,
+        int fileRetryAttempts,
+        List<String> excludeFilePatterns,
+        List<String> excludeDirectoryPatterns
 ) {
 }
