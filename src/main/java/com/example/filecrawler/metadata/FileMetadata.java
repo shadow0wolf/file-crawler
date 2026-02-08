@@ -1,5 +1,7 @@
 package com.example.filecrawler.metadata;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.time.Instant;
 
 /**
@@ -8,8 +10,8 @@ import java.time.Instant;
 public record FileMetadata(
         long id,
         long parentId,
-        String parentPath,
-        String path,
+        @JsonProperty(access = JsonProperty.Access.WRITE_ONLY) String parentPath,
+        @JsonProperty(access = JsonProperty.Access.WRITE_ONLY) String path,
         String name,
         long size,
         String mimeType,
