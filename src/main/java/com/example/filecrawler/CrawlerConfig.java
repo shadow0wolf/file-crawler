@@ -19,7 +19,7 @@ public record CrawlerConfig(
         boolean s3SyncEnabled,
         Optional<String> s3Bucket,
         Optional<String> s3Prefix,
-        Optional<String> s3Region
+        Optional<String> s3Region,
         int fileRetryAttempts,
         List<String> excludeFilePatterns,
         List<String> excludeDirectoryPatterns

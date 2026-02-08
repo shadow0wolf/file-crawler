@@ -14,6 +14,18 @@ public class ConfigLoader {
     private static final int DEFAULT_BUFFER_THRESHOLD = 1000;
     private static final int DEFAULT_CHECKPOINT_INTERVAL = 2000;
     private static final int DEFAULT_FILE_RETRY_ATTEMPTS = 2;
+    private static final List<String> DEFAULT_EXCLUDE_FILES = List.of(
+            "Thumbs.db",
+            "desktop.ini",
+            "ehthumbs.db",
+            "pagefile.sys",
+            "hiberfil.sys",
+            "swapfile.sys"
+    );
+    private static final List<String> DEFAULT_EXCLUDE_DIRECTORIES = List.of(
+            "$RECYCLE.BIN",
+            "System Volume Information"
+    );
 
     private final ObjectMapper mapper;
 
@@ -23,30 +35,6 @@ public class ConfigLoader {
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     }
 
-    /**
-     * Loads the crawler configuration from a JSON file and applies defaults for
-     * optional fields (buffer thresholds, thread count, checkpoint file).
-     */
-    public static CrawlerConfig load(Path configPath) throws IOException {
-        ConfigPayload payload = MAPPER.readValue(Files.newBufferedReader(configPath), ConfigPayload.class);
-        List<Path> roots = payload.roots.stream().map(Path::of).collect(Collectors.toList());
-        Path outputDirectory = Path.of(payload.outputDirectory);
-        int bufferThreshold = payload.bufferEntryThreshold == null ? 1000 : payload.bufferEntryThreshold;
-        int checkpointInterval = payload.checkpointEntryInterval == null ? 2000 : payload.checkpointEntryInterval;
-        int threadCount = payload.threadCount == null ? Runtime.getRuntime().availableProcessors() : payload.threadCount;
-        boolean followLinks = payload.followLinks != null && payload.followLinks;
-        // If omitted, checkpoint defaults to the output directory.
-        Optional<Path> checkpointFile = Optional.ofNullable(payload.checkpointFile)
-                .map(Path::of)
-                .or(() -> Optional.of(outputDirectory.resolve("checkpoint.json")));
-        Optional<Integer> maxEntries = Optional.ofNullable(payload.maxEntries);
-        boolean s3SyncEnabled = payload.s3SyncEnabled != null && payload.s3SyncEnabled;
-        Optional<String> s3Bucket = Optional.ofNullable(payload.s3Bucket).filter(value -> !value.isBlank());
-        Optional<String> s3Prefix = Optional.ofNullable(payload.s3Prefix).filter(value -> !value.isBlank());
-        Optional<String> s3Region = Optional.ofNullable(payload.s3Region).filter(value -> !value.isBlank());
-        if (s3SyncEnabled && s3Bucket.isEmpty()) {
-            throw new IllegalArgumentException("s3Bucket is required when s3SyncEnabled is true.");
-        }
     public CrawlerConfig load(Path path) throws IOException {
         RawConfig raw = mapper.readValue(path.toFile(), RawConfig.class);
 
@@ -70,10 +58,20 @@ public class ConfigLoader {
                 : DEFAULT_FILE_RETRY_ATTEMPTS;
 
         List<Path> roots = raw.roots.stream().map(Path::of).toList();
-        Optional<Path> checkpointFile = Optional.ofNullable(raw.checkpointFile).map(Path::of);
+        Optional<Path> checkpointFile = Optional.ofNullable(raw.checkpointFile)
+                .map(Path::of)
+                .or(() -> Optional.of(outputDirectory.resolve("checkpoint.json")));
         Optional<Integer> maxEntries = Optional.ofNullable(raw.maxEntries);
-        List<String> excludeFilePatterns = raw.excludeFilePatterns == null ? List.of() : List.copyOf(raw.excludeFilePatterns);
-        List<String> excludeDirectoryPatterns = raw.excludeDirectoryPatterns == null ? List.of() : List.copyOf(raw.excludeDirectoryPatterns);
+        boolean s3SyncEnabled = raw.s3SyncEnabled != null && raw.s3SyncEnabled;
+        Optional<String> s3Bucket = Optional.ofNullable(raw.s3Bucket).filter(value -> !value.isBlank());
+        Optional<String> s3Prefix = Optional.ofNullable(raw.s3Prefix).filter(value -> !value.isBlank());
+        Optional<String> s3Region = Optional.ofNullable(raw.s3Region).filter(value -> !value.isBlank());
+        if (s3SyncEnabled && s3Bucket.isEmpty()) {
+            throw new IllegalArgumentException("s3Bucket is required when s3SyncEnabled is true.");
+        }
+
+        List<String> excludeFilePatterns = mergePatterns(DEFAULT_EXCLUDE_FILES, raw.excludeFilePatterns);
+        List<String> excludeDirectoryPatterns = mergePatterns(DEFAULT_EXCLUDE_DIRECTORIES, raw.excludeDirectoryPatterns);
 
         return new CrawlerConfig(
                 roots,
@@ -87,11 +85,24 @@ public class ConfigLoader {
                 s3SyncEnabled,
                 s3Bucket,
                 s3Prefix,
-                s3Region
+                s3Region,
                 fileRetryAttempts,
                 excludeFilePatterns,
                 excludeDirectoryPatterns
         );
+    }
+
+    private List<String> mergePatterns(List<String> defaults, List<String> overrides) {
+        List<String> merged = new ArrayList<>(defaults);
+        if (overrides != null) {
+            for (String pattern : overrides) {
+                if (pattern == null || pattern.isBlank() || merged.contains(pattern)) {
+                    continue;
+                }
+                merged.add(pattern);
+            }
+        }
+        return List.copyOf(merged);
     }
 
     private String optionalString(String value, String fallback) {

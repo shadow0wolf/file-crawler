@@ -417,12 +417,15 @@ public class CrawlerEngine {
         long id = idRegistry.idFor(directory);
         long parentId = directory.getParent() == null ? -1L : idRegistry.idFor(directory.getParent());
         String parentPath = directory.getParent() == null ? null : directory.getParent().toString();
+        String relativePath = directory.getParent() == null
+                ? directory.toString()
+                : (directory.getFileName() == null ? directory.toString() : directory.getFileName().toString());
         String fileKey = attributes.fileKey() == null ? null : attributes.fileKey().toString();
         return new DirectoryMetadata(
                 id,
                 parentId,
                 parentPath,
-                directory.toString(),
+                relativePath,
                 directory.getFileName() == null ? directory.toString() : directory.getFileName().toString(),
                 stats.totalFiles(),
                 stats.totalBytes(),
@@ -520,6 +523,8 @@ public class CrawlerEngine {
         if (!Files.exists(outputDirectory)) {
             return processed;
         }
+        Map<Long, DirectoryMetadata> directories = new HashMap<>();
+        List<FileMetadata> files = new ArrayList<>();
         try (var stream = Files.list(outputDirectory)) {
             for (Path path : stream.toList()) {
                 String name = path.getFileName().toString();
@@ -529,18 +534,67 @@ public class CrawlerEngine {
                 try {
                     MetadataEnvelope[] envelopes = mapper.readValue(path.toFile(), MetadataEnvelope[].class);
                     for (MetadataEnvelope envelope : envelopes) {
-                        if (!"file".equals(envelope.type())) {
-                            continue;
+                        if ("directory".equals(envelope.type())) {
+                            DirectoryMetadata directory = mapper.convertValue(envelope.payload(), DirectoryMetadata.class);
+                            directories.put(directory.id(), directory);
+                        } else if ("file".equals(envelope.type())) {
+                            FileMetadata metadata = mapper.convertValue(envelope.payload(), FileMetadata.class);
+                            files.add(metadata);
                         }
-                        FileMetadata metadata = mapper.convertValue(envelope.payload(), FileMetadata.class);
-                        processed.add(Path.of(metadata.path()).toAbsolutePath().normalize());
                     }
                 } catch (Exception ex) {
                     logger.warn("Failed to read existing metadata file {}", path, ex);
                 }
             }
         }
+        Map<Long, Path> resolvedDirectories = new HashMap<>();
+        for (FileMetadata metadata : files) {
+            Path filePath = resolveFilePath(metadata, directories, resolvedDirectories);
+            if (filePath != null) {
+                processed.add(filePath.toAbsolutePath().normalize());
+            }
+        }
         return processed;
+    }
+
+    private Path resolveFilePath(FileMetadata metadata,
+                                 Map<Long, DirectoryMetadata> directories,
+                                 Map<Long, Path> resolvedDirectories) {
+        if (metadata.path() != null && !metadata.path().isBlank()) {
+            return Path.of(metadata.path());
+        }
+        Path parentPath = resolveDirectoryPath(metadata.parentId(), directories, resolvedDirectories);
+        if (parentPath == null || metadata.name() == null || metadata.name().isBlank()) {
+            return null;
+        }
+        return parentPath.resolve(metadata.name());
+    }
+
+    private Path resolveDirectoryPath(long directoryId,
+                                      Map<Long, DirectoryMetadata> directories,
+                                      Map<Long, Path> resolvedDirectories) {
+        if (directoryId < 0) {
+            return null;
+        }
+        Path cached = resolvedDirectories.get(directoryId);
+        if (cached != null) {
+            return cached;
+        }
+        DirectoryMetadata metadata = directories.get(directoryId);
+        if (metadata == null || metadata.path() == null || metadata.path().isBlank()) {
+            return null;
+        }
+        Path resolved;
+        if (metadata.parentId() < 0) {
+            resolved = Path.of(metadata.path());
+        } else {
+            Path parent = resolveDirectoryPath(metadata.parentId(), directories, resolvedDirectories);
+            resolved = parent == null ? null : parent.resolve(metadata.path());
+        }
+        if (resolved != null) {
+            resolvedDirectories.put(directoryId, resolved);
+        }
+        return resolved;
     }
 
     private List<PathMatcher> buildMatchers(List<String> patterns) {
