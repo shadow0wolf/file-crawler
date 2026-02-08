@@ -11,55 +11,44 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.PathMatcher;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.Future;
 
-/**
- * Orchestrates the crawl lifecycle: directory traversal, file metadata extraction,
- * buffering output to JSON, and checkpoint persistence for recovery.
- */
-public final class CrawlerEngine {
-    private static final Logger LOGGER = LoggerFactory.getLogger(CrawlerEngine.class);
-    private static final MetadataEnvelope POISON = new MetadataEnvelope("poison", "poison");
+public class CrawlerEngine {
+    private static final Logger logger = LoggerFactory.getLogger(CrawlerEngine.class);
 
     private final CrawlerConfig config;
     private final CheckpointManager checkpointManager;
-    private final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private final ProcessingLimiter limiter;
+    private final FileMetadataExtractor extractor;
 
-    public CrawlerEngine(CrawlerConfig config, CheckpointManager checkpointManager) {
-        this(config, checkpointManager, ProcessingLimiter.NO_LIMIT);
-    }
-
-    CrawlerEngine(CrawlerConfig config, CheckpointManager checkpointManager, ProcessingLimiter limiter) {
+    public CrawlerEngine(CrawlerConfig config, CheckpointManager checkpointManager, ProcessingLimiter limiter) {
         this.config = config;
         this.checkpointManager = checkpointManager;
-        this.limiter = limiter;
+        this.limiter = limiter == null ? ProcessingLimiter.NO_LIMIT : limiter;
+        this.extractor = new FileMetadataExtractor(new Tika());
     }
 
-    /**
-     * Executes a crawl run. The method restores prior checkpoint state (if present),
-     * streams file metadata to a background consumer, and emits directory summaries
-     * at the end of a successful run.
-     */
     public void run() throws IOException, InterruptedException {
         Optional<RunState> existing = checkpointManager.load();
         RunState runState = existing.orElse(null);
@@ -159,6 +148,122 @@ public final class CrawlerEngine {
                             if (limiter.shouldStop(count)) {
                                 LOGGER.info("Stopping early after {} entries for checkpoint testing.", count);
                                 stopRequested = true;
+        Path outputDirectory = config.outputDirectory();
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+
+        Optional<RunState> loadedState = checkpointManager == null ? Optional.empty() : checkpointManager.load();
+        Deque<Path> directoryQueue = new ArrayDeque<>();
+        Map<Path, DirectoryStats> directoryStats = new HashMap<>();
+        List<Path> visitedDirectories = new ArrayList<>();
+        Set<Path> processedFiles = new HashSet<>();
+        List<Path> rootPaths = config.roots().stream()
+                .map(path -> path.toAbsolutePath().normalize())
+                .toList();
+
+        IdRegistry idRegistry;
+        int nextMetadataSequence = 1;
+        if (loadedState.isPresent()) {
+            RunState state = loadedState.get();
+            idRegistry = new IdRegistry(state.nextId());
+            nextMetadataSequence = state.nextSequence();
+            processedFiles.addAll(loadProcessedFiles(outputDirectory, mapper));
+            if (state.inProgressDirectory() != null) {
+                directoryQueue.add(Path.of(state.inProgressDirectory()).toAbsolutePath().normalize());
+            }
+            state.pendingDirectories().stream()
+                    .map(Path::of)
+                    .map(path -> path.toAbsolutePath().normalize())
+                    .forEach(directoryQueue::add);
+            state.directoryStats().forEach((path, snapshot) -> {
+                Path dirPath = Path.of(path).toAbsolutePath().normalize();
+                directoryStats.put(dirPath, new DirectoryStats(snapshot.totalFiles(), snapshot.totalBytes()));
+                visitedDirectories.add(dirPath);
+            });
+        } else {
+            idRegistry = new IdRegistry(1L);
+            for (Path root : rootPaths) {
+                directoryQueue.add(root);
+            }
+        }
+
+        int nextFailureSequence = determineNextSequence(outputDirectory, "failed_");
+        JsonBuffer<MetadataEnvelope> metadataBuffer = new JsonBuffer<>(mapper, outputDirectory,
+                config.bufferEntryThreshold(), nextMetadataSequence);
+        JsonBuffer<FailedFileRecord> failureBuffer = new JsonBuffer<>(mapper, outputDirectory,
+                config.bufferEntryThreshold(), nextFailureSequence, "failed_");
+
+        ExecutorService executor = Executors.newFixedThreadPool(config.threadCount());
+        CompletionService<FileProcessingResult> completionService = new ExecutorCompletionService<>(executor);
+
+        List<PathMatcher> fileMatchers = buildMatchers(config.excludeFilePatterns());
+        List<PathMatcher> directoryMatchers = buildMatchers(config.excludeDirectoryPatterns());
+
+        long processedCount = 0L;
+        int inFlight = 0;
+        boolean stopRequested = false;
+        int maxInFlight = limiter == ProcessingLimiter.NO_LIMIT && config.maxEntries().isEmpty()
+                ? config.threadCount()
+                : 1;
+
+        Path currentDirectory = null;
+        while ((!directoryQueue.isEmpty() || inFlight > 0) && !stopRequested) {
+            while (!directoryQueue.isEmpty() && !stopRequested) {
+                Path directory = directoryQueue.poll();
+                if (directory == null) {
+                    break;
+                }
+                currentDirectory = directory;
+                if (matchesAny(directory, directoryMatchers)) {
+                    logger.debug("Skipping excluded directory: {}", directory);
+                    continue;
+                }
+                if (!config.followLinks() && Files.isSymbolicLink(directory)) {
+                    logger.debug("Skipping symlinked directory: {}", directory);
+                    continue;
+                }
+                Path normalizedDirectory = directory.toAbsolutePath().normalize();
+                if (!visitedDirectories.contains(normalizedDirectory)) {
+                    visitedDirectories.add(normalizedDirectory);
+                }
+                if (checkpointManager != null) {
+                    saveCheckpoint(directoryQueue, directory, idRegistry, metadataBuffer, directoryStats);
+                }
+
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+                    for (Path entry : stream) {
+                        if (stopRequested) {
+                            break;
+                        }
+                        Path normalizedEntry = entry.toAbsolutePath().normalize();
+                        if (Files.isDirectory(entry)) {
+                            if (matchesAny(normalizedEntry, directoryMatchers)) {
+                                continue;
+                            }
+                            if (!config.followLinks() && Files.isSymbolicLink(entry)) {
+                                continue;
+                            }
+                            directoryQueue.add(normalizedEntry);
+                        } else if (Files.isRegularFile(entry)) {
+                            if (matchesAny(normalizedEntry, fileMatchers)) {
+                                continue;
+                            }
+                            if (processedFiles.contains(normalizedEntry)) {
+                                continue;
+                            }
+                            if (config.maxEntries().isPresent()
+                                    && processedCount + inFlight >= config.maxEntries().get()) {
+                                stopRequested = true;
+                                break;
+                            }
+                            completionService.submit(() -> processFile(normalizedEntry, idRegistry));
+                            inFlight++;
+
+                            if (inFlight >= maxInFlight) {
+                                Future<FileProcessingResult> future = completionService.take();
+                                processedCount += handleResult(future, metadataBuffer, failureBuffer, directoryStats, rootPaths, processedFiles);
+                                inFlight--;
+                                stopRequested = shouldStop(processedCount);
+                                maybeCheckpoint(processedCount, directoryQueue, directory, idRegistry, metadataBuffer, directoryStats);
                             }
                         }
                     }
@@ -196,134 +301,269 @@ public final class CrawlerEngine {
         } finally {
             syncer.close();
         }
-    }
-
-    private void submitFileTask(ExecutorService executor,
-                                FileMetadataExtractor extractor,
-                                BlockingQueue<MetadataEnvelope> queue,
-                                IdRegistry idRegistry,
-                                Path file) {
-        executor.submit(() -> {
-            long id = idRegistry.idFor(file);
-            long parentId = file.getParent() == null ? -1 : idRegistry.idFor(file.getParent());
-            try {
-                FileMetadata metadata = extractor.extract(file, id, parentId);
-                queue.put(MetadataEnvelope.file(metadata));
-            } catch (Exception ex) {
-                LOGGER.warn("Failed to extract metadata for {}", file, ex);
-            }
-        });
-    }
-
-    private void consumeResults(BlockingQueue<MetadataEnvelope> queue, JsonBuffer buffer) {
-        try {
-            while (true) {
-                MetadataEnvelope envelope = queue.take();
-                if (envelope == POISON) {
-                    return;
+                    logger.warn("Failed to scan directory {}", directory, ex);
                 }
-                buffer.add(envelope);
             }
-        } catch (InterruptedException | IOException ex) {
-            Thread.currentThread().interrupt();
-            LOGGER.error("Metadata consumer stopped unexpectedly", ex);
+
+            while (inFlight > 0 && !stopRequested) {
+                Future<FileProcessingResult> future = completionService.take();
+                processedCount += handleResult(future, metadataBuffer, failureBuffer, directoryStats, rootPaths, processedFiles);
+                inFlight--;
+                stopRequested = shouldStop(processedCount);
+                maybeCheckpoint(processedCount, directoryQueue, null, idRegistry, metadataBuffer, directoryStats);
+            }
+        }
+
+        executor.shutdown();
+
+        if (!stopRequested) {
+            emitDirectoryMetadata(metadataBuffer, visitedDirectories, directoryStats, idRegistry);
+        }
+
+        metadataBuffer.close();
+        failureBuffer.close();
+
+        if (checkpointManager != null) {
+            Path inProgress = stopRequested ? currentDirectory : null;
+            saveCheckpoint(directoryQueue, inProgress, idRegistry, metadataBuffer, directoryStats);
         }
     }
 
-    private void emitDirectoryMetadata(IdRegistry idRegistry,
-                                       Set<Path> directories,
+    private boolean shouldStop(long processedCount) {
+        if (limiter.shouldStop(processedCount)) {
+            return true;
+        }
+        return config.maxEntries().isPresent() && processedCount >= config.maxEntries().get();
+    }
+
+    private int handleResult(Future<FileProcessingResult> future,
+                             JsonBuffer<MetadataEnvelope> metadataBuffer,
+                             JsonBuffer<FailedFileRecord> failureBuffer,
+                             Map<Path, DirectoryStats> directoryStats,
+                             List<Path> rootPaths,
+                             Set<Path> processedFiles) throws IOException {
+        try {
+            FileProcessingResult result = future.get();
+            if (result.isSuccess()) {
+                FileMetadata metadata = result.getMetadata();
+                metadataBuffer.add(MetadataEnvelope.file(metadata));
+                updateDirectoryStats(Path.of(metadata.path()), metadata.size(), directoryStats, rootPaths);
+                processedFiles.add(Path.of(metadata.path()).toAbsolutePath().normalize());
+            } else {
+                failureBuffer.add(result.getFailure());
+            }
+            return 1;
+        } catch (Exception ex) {
+            logger.warn("Failed to process file result", ex);
+            FailedFileRecord failure = new FailedFileRecord(
+                    "unknown",
+                    1,
+                    1,
+                    Instant.now(),
+                    ex.getMessage(),
+                    List.of(new RetryAttempt(1, Instant.now(), ex.getMessage())));
+            failureBuffer.add(failure);
+            return 1;
+        }
+    }
+
+    private FileProcessingResult processFile(Path path, IdRegistry idRegistry) {
+        int maxAttempts = Math.max(1, config.fileRetryAttempts());
+        List<RetryAttempt> attempts = new ArrayList<>();
+        long parentId = path.getParent() == null ? -1L : idRegistry.idFor(path.getParent());
+        long id = idRegistry.idFor(path);
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                FileMetadata metadata = extractor.extract(path, id, parentId, config.followLinks());
+                return FileProcessingResult.success(metadata);
+            } catch (Exception ex) {
+                RetryAttempt retryAttempt = new RetryAttempt(attempt, Instant.now(), ex.getMessage());
+                attempts.add(retryAttempt);
+                logger.debug("Attempt {} failed for {}", attempt, path, ex);
+            }
+        }
+
+        RetryAttempt lastAttempt = attempts.get(attempts.size() - 1);
+        FailedFileRecord failure = new FailedFileRecord(
+                path.toString(),
+                attempts.size(),
+                maxAttempts,
+                lastAttempt.getTimestamp(),
+                lastAttempt.getError(),
+                attempts);
+        return FileProcessingResult.failure(failure);
+    }
+
+    private void emitDirectoryMetadata(JsonBuffer<MetadataEnvelope> metadataBuffer,
+                                       List<Path> visitedDirectories,
                                        Map<Path, DirectoryStats> directoryStats,
-                                       JsonBuffer buffer) throws IOException {
-        for (Path directory : directories) {
-            DirectoryStats stats = directoryStats.getOrDefault(normalize(directory), new DirectoryStats());
-            DirectoryMetadata metadata = directoryMetadataFor(idRegistry, directory, stats);
-            buffer.add(MetadataEnvelope.directory(metadata));
+                                       IdRegistry idRegistry) throws IOException {
+        visitedDirectories.sort(Comparator.comparing(Path::toString));
+        LinkOption[] linkOptions = config.followLinks() ? new LinkOption[0] : new LinkOption[]{LinkOption.NOFOLLOW_LINKS};
+
+        for (Path directory : visitedDirectories) {
+            DirectoryStats stats = directoryStats.getOrDefault(directory, new DirectoryStats());
+            DirectoryMetadata metadata = buildDirectoryMetadata(directory, stats, idRegistry, linkOptions);
+            metadataBuffer.add(MetadataEnvelope.directory(metadata));
         }
     }
 
-    private DirectoryMetadata directoryMetadataFor(IdRegistry idRegistry, Path directory, DirectoryStats stats) throws IOException {
-        BasicFileAttributes attrs = Files.readAttributes(directory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+    private DirectoryMetadata buildDirectoryMetadata(Path directory,
+                                                    DirectoryStats stats,
+                                                    IdRegistry idRegistry,
+                                                    LinkOption[] linkOptions) throws IOException {
+        BasicFileAttributes attributes = Files.readAttributes(directory, BasicFileAttributes.class, linkOptions);
         long id = idRegistry.idFor(directory);
-        Path parent = directory.getParent();
-        long parentId = parent == null ? -1 : idRegistry.idFor(parent);
-        String parentPath = parent == null ? null : parent.toAbsolutePath().toString();
-        Instant created = attrs.creationTime().toInstant();
-        Instant modified = attrs.lastModifiedTime().toInstant();
-        Instant accessed = attrs.lastAccessTime().toInstant();
+        long parentId = directory.getParent() == null ? -1L : idRegistry.idFor(directory.getParent());
+        String parentPath = directory.getParent() == null ? null : directory.getParent().toString();
+        String fileKey = attributes.fileKey() == null ? null : attributes.fileKey().toString();
         return new DirectoryMetadata(
                 id,
                 parentId,
                 parentPath,
-                directory.toAbsolutePath().toString(),
+                directory.toString(),
                 directory.getFileName() == null ? directory.toString() : directory.getFileName().toString(),
                 stats.totalFiles(),
                 stats.totalBytes(),
-                created,
-                modified,
-                accessed,
-                attrs.fileKey() == null ? null : attrs.fileKey().toString()
+                attributes.creationTime().toInstant(),
+                attributes.lastModifiedTime().toInstant(),
+                attributes.lastAccessTime().toInstant(),
+                fileKey
         );
     }
 
-    private void updateAncestorStats(Map<Path, DirectoryStats> directoryStats,
-                                     Set<Path> roots,
-                                     Path file,
-                                     long size) {
-        Path parent = file.getParent();
+    private void updateDirectoryStats(Path filePath,
+                                      long size,
+                                      Map<Path, DirectoryStats> directoryStats,
+                                      List<Path> roots) {
+        Path parent = filePath.getParent();
         while (parent != null) {
-            Path normalized = normalize(parent);
+            Path normalized = parent.toAbsolutePath().normalize();
+            boolean withinRoot = roots.stream().anyMatch(normalized::startsWith);
+            if (!withinRoot) {
+                break;
+            }
             directoryStats.computeIfAbsent(normalized, ignored -> new DirectoryStats()).addFile(size);
             if (roots.contains(normalized)) {
                 break;
             }
-            parent = parent.getParent();
+            parent = normalized.getParent();
         }
     }
 
-    private long safeSize(Path file) {
-        try {
-            return Files.size(file);
-        } catch (IOException ex) {
-            LOGGER.warn("Failed to read size for {}", file, ex);
-            return 0L;
+    private void maybeCheckpoint(long processedCount,
+                                 Deque<Path> directoryQueue,
+                                 Path inProgressDirectory,
+                                 IdRegistry idRegistry,
+                                 JsonBuffer<MetadataEnvelope> metadataBuffer,
+                                 Map<Path, DirectoryStats> directoryStats) throws IOException {
+        if (checkpointManager == null) {
+            return;
+        }
+        if (processedCount % config.checkpointEntryInterval() == 0) {
+            saveCheckpoint(directoryQueue, inProgressDirectory, idRegistry, metadataBuffer, directoryStats);
         }
     }
 
-    private boolean shouldSkipPath(Path path) {
-        return !config.followLinks() && Files.isSymbolicLink(path);
-    }
-
-    private void saveCheckpoint(IdRegistry idRegistry,
-                                JsonBuffer buffer,
-                                Deque<Path> pending,
-                                Path inProgress,
+    private void saveCheckpoint(Deque<Path> directoryQueue,
+                                Path inProgressDirectory,
+                                IdRegistry idRegistry,
+                                JsonBuffer<MetadataEnvelope> metadataBuffer,
                                 Map<Path, DirectoryStats> directoryStats) throws IOException {
-        Map<String, DirectoryStatsSnapshot> snapshot = new HashMap<>();
-        for (Map.Entry<Path, DirectoryStats> entry : directoryStats.entrySet()) {
-            snapshot.put(entry.getKey().toAbsolutePath().toString(), DirectoryStatsSnapshot.from(entry.getValue()));
+        if (checkpointManager == null) {
+            return;
         }
-        List<String> pendingList = new ArrayList<>();
-        for (Path path : pending) {
-            pendingList.add(path.toAbsolutePath().toString());
-        }
+        List<String> pendingDirectories = directoryQueue.stream().map(Path::toString).toList();
+        Map<String, DirectoryStatsSnapshot> statsSnapshot = new HashMap<>();
+        directoryStats.forEach((path, stats) -> statsSnapshot.put(path.toString(), DirectoryStatsSnapshot.from(stats)));
+
         RunState state = new RunState(
                 idRegistry.nextId(),
-                buffer.currentSequence(),
-                pendingList,
-                inProgress == null ? null : inProgress.toAbsolutePath().toString(),
-                snapshot
+                metadataBuffer.nextSequence(),
+                pendingDirectories,
+                inProgressDirectory == null ? null : inProgressDirectory.toString(),
+                statsSnapshot
         );
         checkpointManager.save(state);
     }
 
-    private void restoreDirectoryStats(Map<Path, DirectoryStats> target,
-                                       Map<String, DirectoryStatsSnapshot> snapshot) {
-        snapshot.forEach((path, stats) -> {
-            target.put(Path.of(path), new DirectoryStats(stats.totalFiles(), stats.totalBytes()));
-        });
+    private int determineNextSequence(Path outputDirectory, String prefix) throws IOException {
+        if (!Files.exists(outputDirectory)) {
+            return 1;
+        }
+        int max = 0;
+        try (var stream = Files.list(outputDirectory)) {
+            for (Path path : stream.toList()) {
+                String name = path.getFileName().toString();
+                if (!name.startsWith(prefix) || !name.endsWith(".json")) {
+                    continue;
+                }
+                int start = prefix.length();
+                int end = name.length() - ".json".length();
+                if (end <= start) {
+                    continue;
+                }
+                try {
+                    int value = Integer.parseInt(name.substring(start, end));
+                    max = Math.max(max, value);
+                } catch (NumberFormatException ignored) {
+                    // ignore
+                }
+            }
+        }
+        return max + 1;
     }
 
-    private Path normalize(Path path) {
-        return path.toAbsolutePath().normalize();
+    private Set<Path> loadProcessedFiles(Path outputDirectory, ObjectMapper mapper) throws IOException {
+        Set<Path> processed = new HashSet<>();
+        if (!Files.exists(outputDirectory)) {
+            return processed;
+        }
+        try (var stream = Files.list(outputDirectory)) {
+            for (Path path : stream.toList()) {
+                String name = path.getFileName().toString();
+                if (!name.startsWith("metadata_") || !name.endsWith(".json")) {
+                    continue;
+                }
+                try {
+                    MetadataEnvelope[] envelopes = mapper.readValue(path.toFile(), MetadataEnvelope[].class);
+                    for (MetadataEnvelope envelope : envelopes) {
+                        if (!"file".equals(envelope.type())) {
+                            continue;
+                        }
+                        FileMetadata metadata = mapper.convertValue(envelope.payload(), FileMetadata.class);
+                        processed.add(Path.of(metadata.path()).toAbsolutePath().normalize());
+                    }
+                } catch (Exception ex) {
+                    logger.warn("Failed to read existing metadata file {}", path, ex);
+                }
+            }
+        }
+        return processed;
+    }
+
+    private List<PathMatcher> buildMatchers(List<String> patterns) {
+        List<PathMatcher> matchers = new ArrayList<>();
+        for (String pattern : patterns) {
+            if (pattern == null || pattern.isBlank()) {
+                continue;
+            }
+            matchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern));
+        }
+        return matchers;
+    }
+
+    private boolean matchesAny(Path path, List<PathMatcher> matchers) {
+        Path fileName = path.getFileName();
+        for (PathMatcher matcher : matchers) {
+            if (fileName != null && matcher.matches(fileName)) {
+                return true;
+            }
+            if (matcher.matches(path)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

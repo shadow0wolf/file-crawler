@@ -1,18 +1,18 @@
 package com.example.filecrawler;
 
-import com.example.filecrawler.metadata.MetadataEnvelope;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
-public final class JsonBuffer {
+public class JsonBuffer<T> {
     private final ObjectMapper mapper;
     private final Path outputDirectory;
+    private final String prefix;
     private final int threshold;
     private final JsonFileSyncer syncer;
     private final List<MetadataEnvelope> buffer = new ArrayList<>();
@@ -27,37 +27,49 @@ public final class JsonBuffer {
         this.threshold = threshold;
         this.syncer = syncer;
         this.sequence = new AtomicInteger(startingSequence);
+    private final List<T> buffer;
+    private int sequence;
+
+    public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence) {
+        this(mapper, outputDirectory, threshold, startingSequence, "metadata_");
     }
 
-    /**
-     * Returns the next sequence number to be used when flushing output.
-     */
-    public synchronized int currentSequence() {
-        return sequence.get();
+    public JsonBuffer(ObjectMapper mapper,
+                      Path outputDirectory,
+                      int threshold,
+                      int startingSequence,
+                      String prefix) {
+        this.mapper = mapper == null ? new ObjectMapper().registerModule(new JavaTimeModule()) : mapper;
+        this.outputDirectory = outputDirectory;
+        this.prefix = prefix;
+        this.threshold = threshold;
+        this.buffer = new ArrayList<>(threshold);
+        this.sequence = startingSequence;
     }
 
-    /**
-     * Adds a metadata envelope to the buffer, flushing when the threshold is met.
-     */
-    public synchronized void add(MetadataEnvelope envelope) throws IOException {
-        buffer.add(envelope);
+    public synchronized void add(T entry) throws IOException {
+        buffer.add(entry);
         if (buffer.size() >= threshold) {
             flush();
         }
     }
 
-    /**
-     * Flushes the current buffer to a JSON file and clears the in-memory list.
-     */
     public synchronized void flush() throws IOException {
         if (buffer.isEmpty()) {
             return;
         }
         Files.createDirectories(outputDirectory);
-        String fileName = String.format("metadata_%06d.json", sequence.getAndIncrement());
-        Path target = outputDirectory.resolve(fileName);
-        mapper.writerWithDefaultPrettyPrinter().writeValue(target.toFile(), buffer);
+        Path file = outputDirectory.resolve(String.format("%s%06d.json", prefix, sequence++));
+        mapper.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), buffer);
         buffer.clear();
         syncer.enqueue(target);
+    }
+
+    public synchronized void close() throws IOException {
+        flush();
+    }
+
+    public synchronized int nextSequence() {
+        return sequence;
     }
 }

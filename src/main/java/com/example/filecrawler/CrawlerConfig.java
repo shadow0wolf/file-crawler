@@ -20,5 +20,8 @@ public record CrawlerConfig(
         Optional<String> s3Bucket,
         Optional<String> s3Prefix,
         Optional<String> s3Region
+        int fileRetryAttempts,
+        List<String> excludeFilePatterns,
+        List<String> excludeDirectoryPatterns
 ) {
 }

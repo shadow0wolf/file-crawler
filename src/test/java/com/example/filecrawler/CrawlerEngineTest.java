@@ -31,7 +31,10 @@ class CrawlerEngineTest {
                 2,
                 false,
                 java.util.Optional.of(output.resolve("checkpoint.json")),
-                java.util.Optional.empty()
+                java.util.Optional.empty(),
+                2,
+                List.of(),
+                List.of()
         );
 
         CheckpointManager checkpointManager = new CheckpointManager(output.resolve("checkpoint.json"));

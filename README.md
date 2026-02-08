@@ -170,6 +170,15 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
   "s3Bucket": "example-bucket",
   "s3Prefix": "crawler-output",
   "s3Region": "us-east-1"
+  "fileRetryAttempts": 3,
+  "excludeFilePatterns": [
+    "*.tmp",
+    "*.bak"
+  ],
+  "excludeDirectoryPatterns": [
+    "**/node_modules",
+    "**/.git"
+  ]
 }
 ```
 
@@ -184,6 +193,8 @@ When `s3SyncEnabled` is true, each generated `metadata_*.json` file is uploaded 
 ## Output
 
 Each flush writes a JSON array of `MetadataEnvelope` objects to `metadata_000001.json`, `metadata_000002.json`, etc. Each envelope contains a `type` (`file` or `directory`) and the related metadata payload.
+
+Failed file extractions are written to `failed_000001.json`, `failed_000002.json`, etc. Each record includes the file path, the total attempts, and a list of retry attempts (timestamps and error messages).
 
 ## Recovery
 
