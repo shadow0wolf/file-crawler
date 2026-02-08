@@ -165,7 +165,20 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
   "checkpointEntryInterval": 2000,
   "threadCount": 8,
   "followLinks": false,
-  "checkpointFile": "C:/crawler-output/checkpoint.json"
+  "checkpointFile": "C:/crawler-output/checkpoint.json",
+  "s3SyncEnabled": false,
+  "s3Bucket": "example-bucket",
+  "s3Prefix": "crawler-output",
+  "s3Region": "us-east-1"
+  "fileRetryAttempts": 3,
+  "excludeFilePatterns": [
+    "*.tmp",
+    "*.bak"
+  ],
+  "excludeDirectoryPatterns": [
+    "**/node_modules",
+    "**/.git"
+  ]
 }
 ```
 
@@ -173,9 +186,15 @@ java -jar target/file-crawler-1.0.0.jar path/to/config.json
 
 `maxEntries` can be set to limit the number of files processed before a checkpoint is written (useful for testing recovery).
 
+### Optional S3 sync
+
+When `s3SyncEnabled` is true, each generated `metadata_*.json` file is uploaded to the configured bucket using a dedicated single-threaded sync worker. Supply `s3Bucket` to enable uploads and optionally set `s3Prefix` and `s3Region` to control the destination key and AWS region.
+
 ## Output
 
 Each flush writes a JSON array of `MetadataEnvelope` objects to `metadata_000001.json`, `metadata_000002.json`, etc. Each envelope contains a `type` (`file` or `directory`) and the related metadata payload.
+
+Failed file extractions are written to `failed_000001.json`, `failed_000002.json`, etc. Each record includes the file path, the total attempts, and a list of retry attempts (timestamps and error messages).
 
 ## Recovery
 
