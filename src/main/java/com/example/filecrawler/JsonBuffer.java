@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class JsonBuffer<T> {
     private final ObjectMapper mapper;
@@ -15,23 +16,18 @@ public class JsonBuffer<T> {
     private final String prefix;
     private final int threshold;
     private final JsonFileSyncer syncer;
-    private final List<MetadataEnvelope> buffer = new ArrayList<>();
+    private final List<T> buffer;
     private final AtomicInteger sequence;
 
     /**
      * Buffers metadata envelopes and writes them to sequential JSON files.
      */
     public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence, JsonFileSyncer syncer) {
-        this.mapper = mapper;
-        this.outputDirectory = outputDirectory;
-        this.threshold = threshold;
-        this.syncer = syncer;
-        this.sequence = new AtomicInteger(startingSequence);
-    private final List<T> buffer;
-    private int sequence;
+        this(mapper, outputDirectory, threshold, startingSequence, "metadata_", syncer);
+    }
 
     public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence) {
-        this(mapper, outputDirectory, threshold, startingSequence, "metadata_");
+        this(mapper, outputDirectory, threshold, startingSequence, "metadata_", JsonFileSyncer.noop());
     }
 
     public JsonBuffer(ObjectMapper mapper,
@@ -39,12 +35,22 @@ public class JsonBuffer<T> {
                       int threshold,
                       int startingSequence,
                       String prefix) {
+        this(mapper, outputDirectory, threshold, startingSequence, prefix, JsonFileSyncer.noop());
+    }
+
+    public JsonBuffer(ObjectMapper mapper,
+                      Path outputDirectory,
+                      int threshold,
+                      int startingSequence,
+                      String prefix,
+                      JsonFileSyncer syncer) {
         this.mapper = mapper == null ? new ObjectMapper().registerModule(new JavaTimeModule()) : mapper;
         this.outputDirectory = outputDirectory;
         this.prefix = prefix;
         this.threshold = threshold;
+        this.syncer = syncer == null ? JsonFileSyncer.noop() : syncer;
         this.buffer = new ArrayList<>(threshold);
-        this.sequence = startingSequence;
+        this.sequence = new AtomicInteger(startingSequence);
     }
 
     public synchronized void add(T entry) throws IOException {
@@ -59,10 +65,10 @@ public class JsonBuffer<T> {
             return;
         }
         Files.createDirectories(outputDirectory);
-        Path file = outputDirectory.resolve(String.format("%s%06d.json", prefix, sequence++));
+        Path file = outputDirectory.resolve(String.format("%s%06d.json", prefix, sequence.getAndIncrement()));
         mapper.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), buffer);
         buffer.clear();
-        syncer.enqueue(target);
+        syncer.enqueue(file);
     }
 
     public synchronized void close() throws IOException {
@@ -70,6 +76,6 @@ public class JsonBuffer<T> {
     }
 
     public synchronized int nextSequence() {
-        return sequence;
+        return sequence.get();
     }
 }

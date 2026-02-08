@@ -49,7 +49,7 @@ public final class S3SyncService implements JsonFileSyncer {
             return;
         }
         closed = true;
-        queue.offer(SyncTask.poison());
+        queue.offer(SyncTask.poisonPill());
         try {
             worker.join();
         } catch (InterruptedException ex) {
@@ -108,7 +108,7 @@ public final class S3SyncService implements JsonFileSyncer {
             this(path, false);
         }
 
-        private static SyncTask poison() {
+        private static SyncTask poisonPill() {
             return new SyncTask(null, true);
         }
     }
