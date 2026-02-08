@@ -46,7 +46,7 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>s3</artifactId>
-            <version>${aws.sdk.version}</version>
+            <version>2.26.21</version>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>
@@ -103,7 +103,7 @@
                                     <mainClass>com.example.filecrawler.App</mainClass>
                                 </transformer>
                                 <!-- Merge META-INF services for Tika/SLF4J -->
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shadeqq.resource.ServicesResourceTransformer"/>
                             </transformers>
                         </configuration>
                     </execution>

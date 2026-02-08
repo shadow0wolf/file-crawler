@@ -1,0 +1,26 @@
+{
+  "roots": [
+    "d:/"
+  ],
+
+  "outputDirectory": "./output",
+  "bufferEntryThreshold": 1000,
+  "checkpointEntryInterval": 2000,
+  "threadCount": 4,
+  "followLinks": false,
+  "checkpointFile": "./output/checkpoint/checkpoint.json",
+
+  "s3SyncEnabled": true,
+  "s3Bucket": "input-ccc",
+  "s3Prefix": "crawler-output",
+  "s3Region": "us-east-1",
+  "fileRetryAttempts": 2,
+  "excludeFilePatterns": [
+    "*.tmp",
+    "*.bak"
+  ],
+  "excludeDirectoryPatterns": [
+    "**/node_modules",
+    "**/.git"
+  ]
+}
