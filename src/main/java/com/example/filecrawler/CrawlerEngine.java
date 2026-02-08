@@ -64,6 +64,16 @@ public final class CrawlerEngine {
         Optional<RunState> existing = checkpointManager.load();
         RunState runState = existing.orElse(null);
 
+        JsonFileSyncer syncer = JsonFileSyncer.noop();
+        if (config.s3SyncEnabled()) {
+            syncer = new S3SyncService(
+                    config.outputDirectory(),
+                    config.s3Bucket().orElseThrow(),
+                    config.s3Prefix().orElse(""),
+                    config.s3Region()
+            );
+        }
+
         long startingId = runState == null ? 1L : runState.nextId();
         int startingSequence = runState == null ? 1 : runState.nextSequence();
 
@@ -77,105 +87,115 @@ public final class CrawlerEngine {
         }
 
         // Buffer JSON payloads so we can write them in deterministic batches.
-        JsonBuffer buffer = new JsonBuffer(mapper, config.outputDirectory(), config.bufferEntryThreshold(), startingSequence);
-        BlockingQueue<MetadataEnvelope> resultQueue = new LinkedBlockingQueue<>();
+        try {
+            JsonBuffer buffer = new JsonBuffer(
+                    mapper,
+                    config.outputDirectory(),
+                    config.bufferEntryThreshold(),
+                    startingSequence,
+                    syncer
+            );
+            BlockingQueue<MetadataEnvelope> resultQueue = new LinkedBlockingQueue<>();
 
-        // Dedicated consumer flushes metadata to disk while workers continue extracting.
-        Thread consumer = new Thread(() -> consumeResults(resultQueue, buffer));
-        consumer.start();
+            // Dedicated consumer flushes metadata to disk while workers continue extracting.
+            Thread consumer = new Thread(() -> consumeResults(resultQueue, buffer));
+            consumer.start();
 
-        Deque<Path> pending = new ArrayDeque<>();
-        if (runState != null) {
-            runState.pendingDirectories().stream().map(Path::of).forEach(pending::addLast);
-            if (runState.inProgressDirectory() != null) {
-                pending.addFirst(Path.of(runState.inProgressDirectory()));
-            }
-        } else {
-            config.roots().forEach(pending::addLast);
-        }
-
-        ExecutorService fileExecutor = Executors.newFixedThreadPool(config.threadCount());
-        FileMetadataExtractor extractor = new FileMetadataExtractor(new Tika());
-        AtomicLong processedEntries = new AtomicLong();
-        Set<Path> rootSet = config.roots().stream().map(this::normalize).collect(java.util.stream.Collectors.toSet());
-        boolean stopRequested = false;
-
-        while (!pending.isEmpty()) {
-            Path current = pending.removeFirst();
-            if (shouldSkipPath(current)) {
-                continue;
+            Deque<Path> pending = new ArrayDeque<>();
+            if (runState != null) {
+                runState.pendingDirectories().stream().map(Path::of).forEach(pending::addLast);
+                if (runState.inProgressDirectory() != null) {
+                    pending.addFirst(Path.of(runState.inProgressDirectory()));
+                }
+            } else {
+                config.roots().forEach(pending::addLast);
             }
 
-            // Persist progress before we begin scanning a directory so recovery can resume.
-            saveCheckpoint(idRegistry, buffer, pending, current, directoryStats);
+            ExecutorService fileExecutor = Executors.newFixedThreadPool(config.threadCount());
+            FileMetadataExtractor extractor = new FileMetadataExtractor(new Tika());
+            AtomicLong processedEntries = new AtomicLong();
+            Set<Path> rootSet = config.roots().stream().map(this::normalize).collect(java.util.stream.Collectors.toSet());
+            boolean stopRequested = false;
 
-            BasicFileAttributes attrs;
-            try {
-                attrs = Files.readAttributes(current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            } catch (IOException ex) {
-                LOGGER.warn("Failed to read attributes for {}", current, ex);
-                continue;
-            }
+            while (!pending.isEmpty()) {
+                Path current = pending.removeFirst();
+                if (shouldSkipPath(current)) {
+                    continue;
+                }
 
-            if (!attrs.isDirectory()) {
-                continue;
-            }
+                // Persist progress before we begin scanning a directory so recovery can resume.
+                saveCheckpoint(idRegistry, buffer, pending, current, directoryStats);
 
-            directories.add(current);
-            directoryStats.computeIfAbsent(normalize(current), ignored -> new DirectoryStats());
-            idRegistry.idFor(current);
+                BasicFileAttributes attrs;
+                try {
+                    attrs = Files.readAttributes(current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                } catch (IOException ex) {
+                    LOGGER.warn("Failed to read attributes for {}", current, ex);
+                    continue;
+                }
 
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(current)) {
-                for (Path entry : stream) {
-                    if (shouldSkipPath(entry)) {
-                        continue;
-                    }
-                    if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
-                        pending.addLast(entry);
-                    } else if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
-                        long size = safeSize(entry);
-                        // Update stats for the directory ancestry chain while walking.
-                        updateAncestorStats(directoryStats, rootSet, entry, size);
-                        // File metadata extraction is parallelized across the executor.
-                        submitFileTask(fileExecutor, extractor, resultQueue, idRegistry, entry);
-                        long count = processedEntries.incrementAndGet();
-                        if (limiter.shouldStop(count)) {
-                            LOGGER.info("Stopping early after {} entries for checkpoint testing.", count);
-                            stopRequested = true;
+                if (!attrs.isDirectory()) {
+                    continue;
+                }
+
+                directories.add(current);
+                directoryStats.computeIfAbsent(normalize(current), ignored -> new DirectoryStats());
+                idRegistry.idFor(current);
+
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(current)) {
+                    for (Path entry : stream) {
+                        if (shouldSkipPath(entry)) {
+                            continue;
+                        }
+                        if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) {
+                            pending.addLast(entry);
+                        } else if (Files.isRegularFile(entry, LinkOption.NOFOLLOW_LINKS)) {
+                            long size = safeSize(entry);
+                            // Update stats for the directory ancestry chain while walking.
+                            updateAncestorStats(directoryStats, rootSet, entry, size);
+                            // File metadata extraction is parallelized across the executor.
+                            submitFileTask(fileExecutor, extractor, resultQueue, idRegistry, entry);
+                            long count = processedEntries.incrementAndGet();
+                            if (limiter.shouldStop(count)) {
+                                LOGGER.info("Stopping early after {} entries for checkpoint testing.", count);
+                                stopRequested = true;
+                            }
                         }
                     }
+                } catch (IOException ex) {
+                    LOGGER.warn("Failed to list directory {}", current, ex);
                 }
-            } catch (IOException ex) {
-                LOGGER.warn("Failed to list directory {}", current, ex);
+
+                // Periodically checkpoint based on processed file counts.
+                if (processedEntries.get() % config.checkpointEntryInterval() == 0) {
+                    saveCheckpoint(idRegistry, buffer, pending, null, directoryStats);
+                }
+                if (stopRequested || limiter.shouldStop(processedEntries.get())) {
+                    break;
+                }
             }
 
-            // Periodically checkpoint based on processed file counts.
-            if (processedEntries.get() % config.checkpointEntryInterval() == 0) {
+            // Drain worker pool and flush the remaining buffered metadata.
+            fileExecutor.shutdown();
+            fileExecutor.awaitTermination(1, TimeUnit.HOURS);
+            resultQueue.add(POISON);
+            consumer.join();
+            buffer.flush();
+
+            if (stopRequested) {
                 saveCheckpoint(idRegistry, buffer, pending, null, directoryStats);
+                LOGGER.info("Crawl paused with checkpoint.");
+                return;
             }
-            if (stopRequested || limiter.shouldStop(processedEntries.get())) {
-                break;
-            }
+
+            // Directory metadata is derived after file processing so totals are complete.
+            emitDirectoryMetadata(idRegistry, directories, directoryStats, buffer);
+            buffer.flush();
+            saveCheckpoint(idRegistry, buffer, new ArrayDeque<>(), null, directoryStats);
+            LOGGER.info("Crawl completed.");
+        } finally {
+            syncer.close();
         }
-
-        // Drain worker pool and flush the remaining buffered metadata.
-        fileExecutor.shutdown();
-        fileExecutor.awaitTermination(1, TimeUnit.HOURS);
-        resultQueue.add(POISON);
-        consumer.join();
-        buffer.flush();
-
-        if (stopRequested) {
-            saveCheckpoint(idRegistry, buffer, pending, null, directoryStats);
-            LOGGER.info("Crawl paused with checkpoint.");
-            return;
-        }
-
-        // Directory metadata is derived after file processing so totals are complete.
-        emitDirectoryMetadata(idRegistry, directories, directoryStats, buffer);
-        buffer.flush();
-        saveCheckpoint(idRegistry, buffer, new ArrayDeque<>(), null, directoryStats);
-        LOGGER.info("Crawl completed.");
     }
 
     private void submitFileTask(ExecutorService executor,

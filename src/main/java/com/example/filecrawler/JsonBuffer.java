@@ -14,16 +14,18 @@ public final class JsonBuffer {
     private final ObjectMapper mapper;
     private final Path outputDirectory;
     private final int threshold;
+    private final JsonFileSyncer syncer;
     private final List<MetadataEnvelope> buffer = new ArrayList<>();
     private final AtomicInteger sequence;
 
     /**
      * Buffers metadata envelopes and writes them to sequential JSON files.
      */
-    public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence) {
+    public JsonBuffer(ObjectMapper mapper, Path outputDirectory, int threshold, int startingSequence, JsonFileSyncer syncer) {
         this.mapper = mapper;
         this.outputDirectory = outputDirectory;
         this.threshold = threshold;
+        this.syncer = syncer;
         this.sequence = new AtomicInteger(startingSequence);
     }
 
@@ -56,5 +58,6 @@ public final class JsonBuffer {
         Path target = outputDirectory.resolve(fileName);
         mapper.writerWithDefaultPrettyPrinter().writeValue(target.toFile(), buffer);
         buffer.clear();
+        syncer.enqueue(target);
     }
 }

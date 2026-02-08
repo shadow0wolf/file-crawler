@@ -15,6 +15,10 @@ public record CrawlerConfig(
         int threadCount,
         boolean followLinks,
         Optional<Path> checkpointFile,
-        Optional<Integer> maxEntries
+        Optional<Integer> maxEntries,
+        boolean s3SyncEnabled,
+        Optional<String> s3Bucket,
+        Optional<String> s3Prefix,
+        Optional<String> s3Region
 ) {
 }
